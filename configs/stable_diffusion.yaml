@@ -1,0 +1,69 @@
+# Stable Diffusion Fine-tuning 配置
+
+# 数据集配置
+data:
+  root_dir: "data/raw"
+  image_size: 512  # Stable Diffusion默认图像大小
+  batch_size: 4    # 由于模型较大，使用较小的batch size
+  num_workers: 4
+
+# 模型配置
+model:
+  pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+  revision: "fp16"
+  torch_dtype: "float16"
+  use_ema: true
+  gradient_checkpointing: true
+  enable_xformers_memory_efficient_attention: true
+  num_classes: 7
+
+# 训练配置
+training:
+  num_epochs: 100
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  num_timesteps: 1000
+  guidance_scale: 7.5
+  gradient_clip_val: 1.0
+  mixed_precision: "fp16"
+  accumulate_grad_batches: 4  # 梯度累积以模拟更大的batch size
+  max_grad_norm: 1.0
+  
+  # LoRA配置
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.1
+    bias: "none"
+    target_modules: ["q_proj", "k_proj", "v_proj", "out_proj"]
+    use_8bit_adam: true
+
+# 采样配置
+sampling:
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  num_samples_per_class: 100
+  height: 512
+  width: 512
+
+# 评估配置
+evaluation:
+  metrics:
+    - fid
+    - inception_score
+    - classification_accuracy
+    - diversity
+  eval_freq: 1000
+  num_eval_samples: 1000
+
+# 日志配置
+logging:
+  log_dir: "logs/stable_diffusion"
+  save_dir: "checkpoints/stable_diffusion"
+  log_every_n_steps: 100
+  save_every_n_epochs: 5
+  use_wandb: true
+  wandb_project: "skin_lesion_synthesis"
+  wandb_name: "stable_diffusion" 

@@ -1,0 +1,73 @@
+# Image-level Conditional Diffusion Model 配置
+
+# 数据集配置
+data:
+  root_dir: "data/raw"
+  image_size: 256
+  batch_size: 32  # 每个GPU的批次大小
+  num_workers: 4  # 每个GPU的数据加载线程数
+
+# 分布式训练配置
+distributed:
+  backend: "nccl"
+  init_method: "env://"
+  world_size: -1  # 自动检测GPU数量
+  rank: -1  # 自动检测
+  local_rank: -1  # 自动检测
+
+# 模型配置
+model:
+  in_channels: 3
+  out_channels: 3
+  model_channels: 128
+  num_res_blocks: 2
+  attention_resolutions: [16, 8]
+  dropout: 0.1
+  channel_mult: [1, 2, 2, 2]
+  num_heads: 8
+  num_classes: 7
+  use_scale_shift_norm: true
+  resblock_updown: true
+  use_new_attention_order: false
+
+# 训练配置
+training:
+  num_epochs: 100
+  learning_rate: 1e-4
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.999
+  num_timesteps: 1000
+  guidance_scale: 7.5
+  gradient_clip_val: 1.0
+  mixed_precision: true
+  accumulate_grad_batches: 1
+  warmup_steps: 1000  # 学习率预热步数
+  gradient_accumulation_steps: 1  # 梯度累积步数
+  sync_bn: true  # 是否同步BatchNorm
+
+# 采样配置
+sampling:
+  num_inference_steps: 50
+  guidance_scale: 7.5
+  num_samples_per_class: 100
+
+# 评估配置
+evaluation:
+  metrics:
+    - fid
+    - inception_score
+    - classification_accuracy
+    - diversity
+  eval_freq: 1000  # 每1000步评估一次
+  num_eval_samples: 1000  # 评估时生成的样本数
+
+# 日志配置
+logging:
+  log_dir: "logs/image_diffusion"
+  save_dir: "checkpoints/image_diffusion"
+  log_every_n_steps: 100
+  save_every_n_epochs: 5
+  use_wandb: true
+  wandb_project: "skin_lesion_synthesis"
+  wandb_name: "image_diffusion" 
