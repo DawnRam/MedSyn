@@ -1,69 +1,109 @@
-# 皮肤病变分类数据集的扩散模型实验
+# Medical Image Synthesis with Diffusion Models
 
-本项目实现了基于扩散模型的皮肤病变图像生成实验，包括以下实验：
+This project implements diffusion model-based experiments for medical image synthesis, focusing on skin lesion classification dataset. The experiments include:
 
 1. Image-level Conditional Diffusion Model (Classifier-free Guidance)
 2. Latent-level Conditional Diffusion Model
 3. Stable Diffusion Fine-tuning
 
-## 项目结构
+## Project Structure
 
 ```
 .
-├── configs/                 # 配置文件目录
+├── configs/                 # Configuration files
 │   ├── image_diffusion.yaml
 │   ├── latent_diffusion.yaml
 │   └── stable_diffusion.yaml
-├── data/                    # 数据处理相关代码
-│   ├── dataset.py          # 数据集加载和预处理
-│   └── transforms.py       # 数据增强和转换
-├── models/                  # 模型定义
-│   ├── image_diffusion.py  # Image-level扩散模型
-│   ├── latent_diffusion.py # Latent-level扩散模型
-│   └── stable_diffusion.py # Stable Diffusion相关代码
-├── utils/                   # 工具函数
-│   ├── metrics.py          # 评估指标计算
-│   └── visualization.py    # 可视化工具
-├── train.py                 # 训练脚本
-├── evaluate.py             # 评估脚本
-└── requirements.txt        # 项目依赖
+├── data/                    # Data processing
+│   ├── dataset.py          # Dataset loading and preprocessing
+│   └── transforms.py       # Data augmentation and transformations
+├── models/                  # Model definitions
+│   ├── image_diffusion.py  # Image-level diffusion model
+│   ├── latent_diffusion.py # Latent-level diffusion model
+│   └── stable_diffusion.py # Stable Diffusion related code
+├── utils/                   # Utility functions
+│   ├── metrics.py          # Evaluation metrics
+│   └── visualization.py    # Visualization tools
+├── train.py                 # Training script
+├── evaluate.py             # Evaluation script
+└── requirements.txt        # Project dependencies
 ```
 
-## 环境配置
+## Environment Setup
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 数据集准备
+## Dataset Preparation
 
-将数据集放置在 `data/raw/` 目录下，每个类别对应一个子文件夹。
+Place the dataset in the `data/raw/` directory, with each class in a separate subfolder.
 
-## 使用方法
+## Usage
 
-1. 训练 Image-level Diffusion Model:
+1. Train Image-level Diffusion Model:
 ```bash
 python train.py --config configs/image_diffusion.yaml
 ```
 
-2. 训练 Latent-level Diffusion Model:
+2. Train Latent-level Diffusion Model:
 ```bash
 python train.py --config configs/latent_diffusion.yaml
 ```
 
-3. Stable Diffusion Fine-tuning:
+3. Fine-tune Stable Diffusion:
 ```bash
 python train.py --config configs/stable_diffusion.yaml
 ```
 
-4. 评估生成结果:
+4. Evaluate Generated Images:
 ```bash
 python evaluate.py --config configs/evaluation.yaml
 ```
 
-## 评估指标
+## Evaluation Metrics
 
 - FID (Fréchet Inception Distance)
 - IS (Inception Score)
-- 分类准确率
-- 多样性指标 
+- Classification Accuracy
+- Diversity Metrics
+
+## Features
+
+- Multi-GPU training support with DistributedDataParallel
+- Mixed precision training for faster training
+- Gradient accumulation for larger effective batch sizes
+- Learning rate scheduling with warmup
+- Comprehensive evaluation metrics
+- Weights & Biases integration for experiment tracking
+- Checkpoint saving and resuming
+- Data augmentation and preprocessing pipeline
+
+## Requirements
+
+- Python 3.8+
+- PyTorch 2.0+
+- CUDA 11.7+
+- diffusers
+- transformers
+- wandb
+- scikit-learn
+- scipy
+- numpy
+- pillow
+- tqdm
+- yaml
+
+## Citation
+
+If you find this project useful in your research, please consider citing:
+
+```bibtex
+@misc{medsyn2024,
+  author = {Your Name},
+  title = {Medical Image Synthesis with Diffusion Models},
+  year = {2024},
+  publisher = {GitHub},
+  url = {https://github.com/yourusername/MedSyn}
+}
+``` 
