@@ -37,7 +37,7 @@ pip install -r requirements.txt
 
 ## Dataset Preparation
 
-Place the dataset in the `data/raw/` directory, with each class in a separate subfolder.
+Place your dataset in the specified data directory (default: `/home/eechengyang/Data/ISIC`), with each class in a separate subfolder. You can specify a custom data directory using the `-d` or `--data-dir` option when running the training script.
 
 ## Usage
 
@@ -79,31 +79,16 @@ python evaluate.py --config configs/evaluation.yaml
 - Checkpoint saving and resuming
 - Data augmentation and preprocessing pipeline
 
-## Requirements
+## TODO List
 
-- Python 3.8+
-- PyTorch 2.0+
-- CUDA 11.7+
-- diffusers
-- transformers
-- wandb
-- scikit-learn
-- scipy
-- numpy
-- pillow
-- tqdm
-- yaml
+- [ ] Implement Representation Alignment
+- [ ] Implement Density-aware Sampling
+- [ ] Add Medical Image-specific Evaluation Metrics
+- [ ] Implement adaptive learning rate scheduling
+- [ ] Add gradient clipping and regularization
+- [ ] Optimize multi-GPU training efficiency
+- [ ] Implement Medical Image-specific Augmentations
+- [ ] Model quantization and optimization
+- [ ] Batch inference optimization
+- [ ] Add Deployment documentation and examples
 
-## Citation
-
-If you find this project useful in your research, please consider citing:
-
-```bibtex
-@misc{medsyn2024,
-  author = {Your Name},
-  title = {Medical Image Synthesis with Diffusion Models},
-  year = {2024},
-  publisher = {GitHub},
-  url = {https://github.com/yourusername/MedSyn}
-}
-``` 

@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # 默认参数
-NUM_GPUS=1
+NUM_GPUS=4
 MODEL_TYPE="image"  # image/latent/stable
 CONFIG="configs/image_diffusion.yaml"
+DATA_DIR="/home/eechengyang/Data/ISIC"  # 更新数据路径
 BATCH_SIZE=32
 NUM_WORKERS=4
 MIXED_PRECISION=true
@@ -24,6 +25,7 @@ show_help() {
     echo "  -g, --gpus NUM_GPUS        使用的GPU数量 (默认: 1)"
     echo "  -m, --model MODEL_TYPE     模型类型: image/latent/stable (默认: image)"
     echo "  -c, --config CONFIG        配置文件路径 (默认: configs/image_diffusion.yaml)"
+    echo "  -d, --data-dir DIR         数据集路径 (默认: /home/eechengyang/Data/ISIC)"
     echo "  -b, --batch-size SIZE      每个GPU的批次大小 (默认: 32)"
     echo "  -w, --workers NUM          每个GPU的数据加载线程数 (默认: 4)"
     echo "  --no-mixed-precision       禁用混合精度训练"
@@ -54,6 +56,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -c|--config)
             CONFIG="$2"
+            shift 2
+            ;;
+        -d|--data-dir)
+            DATA_DIR="$2"
             shift 2
             ;;
         -b|--batch-size)
@@ -116,6 +122,12 @@ if [[ ! "$MODEL_TYPE" =~ ^(image|latent|stable)$ ]]; then
     exit 1
 fi
 
+# 验证数据路径
+if [ ! -d "$DATA_DIR" ]; then
+    echo "错误: 数据路径 '$DATA_DIR' 不存在"
+    exit 1
+fi
+
 # 设置默认的wandb运行名称
 if [ -z "$WANDB_NAME" ]; then
     WANDB_NAME="${MODEL_TYPE}_diffusion_$(date +%Y%m%d_%H%M%S)"
@@ -134,6 +146,7 @@ fi
 # 构建环境变量
 export WANDB_PROJECT="$WANDB_PROJECT"
 export WANDB_NAME="$WANDB_NAME"
+export TRAIN_DATA_DIR="$DATA_DIR"  # 添加数据路径环境变量
 export TRAIN_BATCH_SIZE="$BATCH_SIZE"
 export TRAIN_NUM_WORKERS="$NUM_WORKERS"
 export TRAIN_MIXED_PRECISION="$MIXED_PRECISION"
@@ -148,6 +161,7 @@ echo "----------------------------------------"
 echo "GPU数量: $NUM_GPUS"
 echo "模型类型: $MODEL_TYPE"
 echo "配置文件: $CONFIG"
+echo "数据路径: $DATA_DIR"
 echo "批次大小: $BATCH_SIZE (每个GPU)"
 echo "数据加载线程数: $NUM_WORKERS (每个GPU)"
 echo "混合精度训练: $MIXED_PRECISION"
