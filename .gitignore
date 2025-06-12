@@ -23,3 +23,8 @@ checkpoints/
 cifar10_data/
 logs/
 wandb/
+
+checkpoints/
+cifar10_data/
+logs/
+wandb/
