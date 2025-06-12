@@ -4,6 +4,7 @@ import yaml
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -13,11 +14,20 @@ import wandb
 from tqdm import tqdm
 import logging
 from pathlib import Path
+import datetime
+import torchvision
+import numpy as np
+from torchvision.datasets import CIFAR10
+from torchvision import transforms
 
-from data.dataset import get_dataloader
+from data.dataset import get_dataloader, SkinLesionDataset, preprocess_imgs_vae
 from utils.metrics import InceptionScore, calculate_fid, calculate_classification_accuracy, calculate_diversity
 from diffusers import UNet2DModel, DDPMScheduler, DDIMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
+from transformers import CLIPTextModel, CLIPTokenizer
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from torchvision.transforms import Compose, ToTensor, Normalize
 
 def parse_args():
     parser = argparse.ArgumentParser(description="训练扩散模型")
@@ -26,6 +36,7 @@ def parse_args():
                       choices=["image", "latent", "stable"], 
                       help="模型类型：image/latent/stable")
     parser.add_argument("--resume", type=str, help="从检查点恢复训练")
+    parser.add_argument("--dataset", type=str, default="skin", choices=["skin", "cifar10"], help="数据集类型")
     return parser.parse_args()
 
 def setup_logging(config):
@@ -57,44 +68,54 @@ def setup_distributed():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
         world_size = int(os.environ['WORLD_SIZE'])
-        gpu = int(os.environ['LOCAL_RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
     else:
         rank = 0
         world_size = 1
-        gpu = 0
+        local_rank = 0
 
-    torch.cuda.set_device(gpu)
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=world_size,
-        rank=rank
-    )
-    return rank, world_size, gpu
-
-def get_dataloader_distributed(
-    root_dir: str,
-    batch_size: int,
-    num_workers: int,
-    image_size: int,
-    split: str,
-    rank: int,
-    world_size: int
-) -> DataLoader:
-    """创建分布式数据加载器"""
-    dataset = SkinLesionDataset(
-        root_dir=root_dir,
-        split=split,
-        image_size=image_size
-    )
+    # 设置设备
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
     
+    # 初始化进程组
+    if world_size > 1:
+        try:
+            dist.init_process_group(
+                backend='nccl',
+                init_method='env://',
+                world_size=world_size,
+                rank=rank
+            )
+        except Exception as e:
+            print(f"Failed to initialize process group: {str(e)}")
+            raise e
+    
+    return rank, world_size, device
+
+def get_dataset(name, root, split, image_size):
+    if name == 'skin':
+        return SkinLesionDataset(root_dir=root, split=split, image_size=image_size)
+    elif name == 'cifar10':
+        transform = transforms.Compose([
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+        ])
+        train = (split == 'train')
+        return CIFAR10(root=root, train=train, download=True, transform=transform)
+    else:
+        raise ValueError('Unknown dataset')
+
+def get_dataloader_distributed_dataset(dataset, batch_size, num_workers, split, rank, world_size):
     sampler = DistributedSampler(
         dataset,
         num_replicas=world_size,
         rank=rank,
         shuffle=(split == "train")
     )
-    
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -104,86 +125,114 @@ def get_dataloader_distributed(
         drop_last=(split == "train")
     )
 
-def train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size):
-    """训练Image-level扩散模型"""
-    # 将模型转换为DDP模型
-    if world_size > 1:
-        model = DDP(model, device_ids=[rank], output_device=rank)
+def euler_sampler(model, latents, labels, noise_scheduler, num_steps=50, cfg_scale=1.0):
+    """Euler采样器，借鉴REPA-E的实现，适配UNet2DModel"""
+    device = latents.device
+    dtype = latents.dtype
     
+    # 时间步从1到0
+    t_steps = torch.linspace(1, 0, num_steps + 1, dtype=torch.float64, device=device)
+    x_next = latents.to(torch.float64)
+    
+    with torch.no_grad():
+        for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+            x_cur = x_next
+            
+            # 处理CFG
+            if cfg_scale > 1.0:
+                # 创建无条件标签（使用类别数作为null标签）
+                null_labels = torch.full_like(labels, 7)  # 假设7是null类别
+                model_input = torch.cat([x_cur] * 2, dim=0)
+                y_cur = torch.cat([labels, null_labels], dim=0)
+            else:
+                model_input = x_cur
+                y_cur = labels
+            
+            # 转换时间步格式为UNet2DModel期望的格式
+            time_input = torch.ones(model_input.size(0), device=device, dtype=torch.float64) * t_cur
+            # 将时间步转换为UNet2DModel期望的格式（0到num_train_timesteps-1）
+            timesteps = (time_input * (noise_scheduler.config.num_train_timesteps - 1)).long()
+            
+            # 模型前向传播
+            noise_pred = model(
+                model_input.to(dtype=dtype), 
+                timesteps.to(dtype=torch.long), 
+                class_labels=y_cur
+            ).sample.to(torch.float64)
+            
+            # CFG处理
+            if cfg_scale > 1.0:
+                noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + cfg_scale * (noise_pred_cond - noise_pred_uncond)
+            
+            # Euler步进
+            x_next = x_cur + (t_next - t_cur) * noise_pred
+    
+    return x_next.to(dtype=dtype)
+
+def train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size, num_classes, dataset_name):
+    """训练Image-level扩散模型，完全仿照classifier-free diffusion guidance逻辑"""
+    if world_size > 1:
+        model = model.to(device)
+        model = DDP(model, device_ids=[rank])
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=config["training"]["num_timesteps"],
+        beta_schedule=config["training"].get("beta_schedule", "linear")
+    )
     optimizer = AdamW(
         model.parameters(),
         lr=config["training"]["learning_rate"],
         weight_decay=config["training"]["weight_decay"],
         betas=(config["training"]["beta1"], config["training"]["beta2"])
     )
-    
-    # 添加学习率调度器
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=config["training"].get("warmup_steps", 0),
         num_training_steps=len(train_loader) * config["training"]["num_epochs"]
     )
-    
     scaler = GradScaler() if config["training"]["mixed_precision"] else None
-    
-    # 训练循环
+    prob_cf = 0.1  # classifier-free概率
     for epoch in range(config["training"]["num_epochs"]):
         if world_size > 1:
             train_loader.sampler.set_epoch(epoch)
-        
         model.train()
         total_loss = 0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['num_epochs']}", 
-                   disable=rank != 0)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['training']['num_epochs']}", disable=rank != 0)
         for batch_idx, (images, labels) in enumerate(pbar):
-            images, labels = images.to(device), labels.to(device)
-            
-            # 前向传播
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            images = preprocess_imgs_vae(images)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (images.shape[0],), device=device).long()
+            noise = torch.randn_like(images)
+            noisy_images = noise_scheduler.add_noise(images, noise, timesteps)
+            # classifier-free标签
+            mask = torch.rand(labels.shape, device=labels.device) < prob_cf
+            labels_cf = labels.clone()
+            if dataset_name == 'cifar10':
+                labels_cf[mask] = 10  # 10为无条件标签
+            else:
+                labels_cf[mask] = num_classes  # 皮肤镜用num_classes为无条件
             with autocast(enabled=config["training"]["mixed_precision"]):
-                loss = model(images, labels)
-            
-            # 反向传播
+                noise_pred = model(noisy_images, timesteps, class_labels=labels_cf).sample
+                loss = nn.functional.mse_loss(noise_pred, noise)
             optimizer.zero_grad()
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), 
-                    config["training"]["gradient_clip_val"]
-                )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config["training"]["gradient_clip_val"])
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), 
-                    config["training"]["gradient_clip_val"]
-                )
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config["training"]["gradient_clip_val"])
                 optimizer.step()
-            
             scheduler.step()
-            
             total_loss += loss.item()
             if rank == 0:
                 pbar.set_postfix({"loss": loss.item()})
-            
-            # 记录日志
-            if batch_idx % config["logging"]["log_every_n_steps"] == 0 and rank == 0:
-                logger.info(f"Epoch {epoch+1}, Batch {batch_idx}, Loss: {loss.item():.4f}")
-                if config["logging"]["use_wandb"]:
-                    wandb.log({
-                        "train/loss": loss.item(),
-                        "train/epoch": epoch + 1,
-                        "train/step": epoch * len(train_loader) + batch_idx,
-                        "train/lr": scheduler.get_last_lr()[0]
-                    })
-            
-            # 评估
-            if batch_idx % config["evaluation"]["eval_freq"] == 0 and rank == 0:
-                evaluate_model(model, val_loader, config, logger, device)
-        
-        # 保存检查点
+            if (epoch > 0) and ((epoch + 1) % 10 == 0) and (batch_idx == len(train_loader) - 1):
+                evaluate_model(model, val_loader, config, logger, device, noise_scheduler, epoch, num_classes, dataset_name)
+                model.train()
         if (epoch + 1) % config["logging"]["save_every_n_epochs"] == 0 and rank == 0:
             save_dir = Path(config["logging"]["save_dir"])
             save_dir.mkdir(parents=True, exist_ok=True)
@@ -196,6 +245,7 @@ def train_image_diffusion(model, train_loader, val_loader, config, logger, devic
                 "model_state_dict": model_state,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "noise_scheduler": noise_scheduler,
                 "loss": total_loss / len(train_loader)
             }, save_dir / f"checkpoint_epoch_{epoch+1}.pt")
 
@@ -207,7 +257,7 @@ def train_latent_diffusion(model, autoencoder, train_loader, val_loader, config,
     
     # 然后训练扩散模型
     logger.info("开始训练扩散模型...")
-    train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size)
+    train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size, 7, "skin")
 
 def train_stable_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size):
     """训练Stable Diffusion模型"""
@@ -228,7 +278,7 @@ def train_stable_diffusion(model, train_loader, val_loader, config, logger, devi
     model = get_peft_model(model, lora_config)
     
     # 训练循环
-    train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size)
+    train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size, 7, "skin")
 
 def train_autoencoder(autoencoder, train_loader, config, logger, device):
     """训练自编码器"""
@@ -268,64 +318,58 @@ def train_autoencoder(autoencoder, train_loader, config, logger, device):
                         "autoencoder/train/step": epoch * len(train_loader) + batch_idx
                     })
 
-def evaluate_model(model, val_loader, config, logger, device):
-    """评估模型性能"""
+def evaluate_model(model, val_loader, config, logger, device, noise_scheduler, epoch, num_classes, dataset_name):
+    """评估函数，完全仿照classifier-free diffusion采样逻辑"""
     model.eval()
-    
-    # 初始化评估指标
-    inception_score = InceptionScore(device=device)
-    all_real_images = []
-    all_gen_images = []
-    all_labels = []
-    
+    num_samples_per_class = 8 if dataset_name == 'cifar10' else 4
+    image_size = config["data"]["image_size"]
+    guidance_scale = 3.0 if dataset_name == 'cifar10' else 4.0
+    noise_scheduler.set_timesteps(50)
+    save_dir = Path(config["logging"]["save_dir"]) / "samples"
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        save_dir.mkdir(parents=True, exist_ok=True)
+    all_samples = []
     with torch.no_grad():
-        for images, labels in tqdm(val_loader, desc="Evaluating"):
-            images, labels = images.to(device), labels.to(device)
-            all_real_images.append(images)
-            all_labels.append(labels)
-            
-            # 生成图像
-            gen_images = model.sample(
-                labels,
-                num_inference_steps=config["sampling"]["num_inference_steps"],
-                guidance_scale=config["sampling"]["guidance_scale"]
+        for class_idx in range(num_classes):
+            labels = torch.full((num_samples_per_class,), class_idx, device=device)
+            latents = torch.randn((num_samples_per_class, 3, image_size, image_size), device=device)
+            for t in noise_scheduler.timesteps:
+                if dataset_name == 'cifar10':
+                    labels_uncond = torch.full_like(labels, 10)
+                else:
+                    labels_uncond = torch.full_like(labels, num_classes)
+                model_input = torch.cat([latents, latents], dim=0)
+                labels_input = torch.cat([labels, labels_uncond], dim=0)
+                noise_pred = model(model_input, t, class_labels=labels_input).sample
+                noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                latents = noise_scheduler.step(noise_pred, t, latents).prev_sample
+            all_samples.append(latents)
+        all_samples = torch.cat(all_samples, dim=0)
+        images = (all_samples.clamp(-1, 1) + 1) / 2
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            for idx, img in enumerate(images):
+                class_idx = idx // num_samples_per_class
+                sample_idx = idx % num_samples_per_class
+                img_path = save_dir / f"sample_class_{class_idx:02d}_idx_{sample_idx:03d}.png"
+                torchvision.utils.save_image(img, img_path)
+            # 直接拼成grid，每行一个类别（如10行8列，每行同一类别）
+            grid = torchvision.utils.make_grid(
+                images,
+                nrow=num_samples_per_class,  # 每行num_samples_per_class张
+                padding=2,
+                normalize=False
             )
-            all_gen_images.append(gen_images)
-    
-    # 计算评估指标
-    real_images = torch.cat(all_real_images, dim=0)
-    gen_images = torch.cat(all_gen_images, dim=0)
-    labels = torch.cat(all_labels, dim=0)
-    
-    metrics = {}
-    
-    # 计算FID
-    if "fid" in config["evaluation"]["metrics"]:
-        fid = calculate_fid(real_images, gen_images, device)
-        metrics["fid"] = fid
-    
-    # 计算Inception Score
-    if "inception_score" in config["evaluation"]["metrics"]:
-        is_mean, is_std = inception_score(gen_images)
-        metrics["inception_score_mean"] = is_mean
-        metrics["inception_score_std"] = is_std
-    
-    # 计算分类准确率
-    if "classification_accuracy" in config["evaluation"]["metrics"]:
-        # 这里需要预训练的分类器
-        # accuracy = calculate_classification_accuracy(classifier, gen_images, labels, device)
-        # metrics["classification_accuracy"] = accuracy
-        pass
-    
-    # 计算多样性
-    if "diversity" in config["evaluation"]["metrics"]:
-        diversity = calculate_diversity(gen_images)
-        metrics["diversity"] = diversity
-    
-    # 记录指标
-    logger.info(f"Evaluation metrics: {metrics}")
-    if config["logging"]["use_wandb"]:
-        wandb.log(metrics)
+            grid_path = save_dir / f"samples_grid_epoch_{epoch+1:03d}.png"
+            torchvision.utils.save_image(grid, grid_path)
+            logger.info(f"Saved generated samples grid to {grid_path}")
+        if config["logging"]["use_wandb"] and (not dist.is_initialized() or dist.get_rank() == 0):
+            wandb.log({
+                "val/generated_images_grid": wandb.Image(grid.cpu()),
+                "val/generated_images": [wandb.Image(img) for img in images.cpu()]
+            })
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        logger.info("Evaluation completed - generated samples for visualization")
 
 def update_config_from_env(config):
     """从环境变量更新配置"""
@@ -348,99 +392,90 @@ def update_config_from_env(config):
             if value.lower() in ('true', 'false'):
                 value = value.lower() == 'true'
             # 转换数值
-            elif value.isdigit():
-                value = int(value)
-            elif value.replace('.', '').isdigit():
-                value = float(value)
+            else:
+                try:
+                    # 尝试转换为整数
+                    value = int(value)
+                except ValueError:
+                    try:
+                        # 尝试转换为浮点数
+                        value = float(value)
+                    except ValueError:
+                        # 如果不是数值，则保留为字符串
+                        pass
             config[section][key] = value
     
     return config
 
 def main():
     args = parse_args()
-    
-    # 加载配置
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
-    
-    # 从环境变量更新配置
-    config = update_config_from_env(config)
-    
-    # 初始化分布式训练
-    rank, world_size, gpu = setup_distributed()
-    device = torch.device(f"cuda:{gpu}")
-    
-    # 设置日志
+    # 动态参数设置
+    if args.dataset == 'skin':
+        num_classes = 7
+        image_size = 256
+        num_class_embeds = 8
+        block_out_channels = [128, 256, 512, 512]
+        data_root = config["data"]["root_dir"]
+    elif args.dataset == 'cifar10':
+        num_classes = 10
+        image_size = 32
+        num_class_embeds = 11
+        block_out_channels = [64, 128, 256, 256]
+        data_root = './cifar10_data'
+    else:
+        raise ValueError('Unknown dataset')
+    # 分布式设置
+    rank, world_size, device = setup_distributed()
     logger = setup_logging(config)
     if rank == 0:
         logger.info(f"Using device: {device}")
         logger.info(f"World size: {world_size}")
+        logger.info(f"Rank: {rank}")
         logger.info("训练配置:")
         logger.info(yaml.dump(config, default_flow_style=False))
-    
-    # 设置wandb（仅在主进程上）
     if rank == 0:
         setup_wandb(config, args.model_type)
-    
-    # 准备数据
-    train_loader = get_dataloader_distributed(
-        config["data"]["root_dir"],
-        batch_size=config["data"]["batch_size"],
+    # 数据集加载
+    train_dataset = get_dataset(args.dataset, data_root, 'train', image_size)
+    val_dataset = get_dataset(args.dataset, data_root, 'val', image_size)
+    train_loader = get_dataloader_distributed_dataset(
+        train_dataset,
+        batch_size=2 if args.dataset == 'cifar10' else config["data"]["batch_size"],
         num_workers=config["data"]["num_workers"],
-        image_size=config["data"]["image_size"],
         split="train",
         rank=rank,
         world_size=world_size
     )
-    
-    val_loader = get_dataloader_distributed(
-        config["data"]["root_dir"],
-        batch_size=config["data"]["batch_size"],
+    val_loader = get_dataloader_distributed_dataset(
+        val_dataset,
+        batch_size=2 if args.dataset == 'cifar10' else config["data"]["batch_size"],
         num_workers=config["data"]["num_workers"],
-        image_size=config["data"]["image_size"],
         split="val",
         rank=rank,
         world_size=world_size
     )
-    
-    # 根据模型类型选择训练函数
-    if args.model_type == "image":
-        from models.image_diffusion import ImageDiffusionModel
-        model = ImageDiffusionModel(**config["model"]).to(device)
-        if args.resume:
-            checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            logger.info(f"从检查点恢复: {args.resume}")
-        train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size)
-    
-    elif args.model_type == "latent":
-        from models.latent_diffusion import LatentDiffusionModel, Autoencoder
-        model = LatentDiffusionModel(**config["model"]).to(device)
-        autoencoder = Autoencoder(**config["autoencoder"]).to(device)
-        if args.resume:
-            checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint["model_state_dict"])
-            ae_checkpoint = torch.load(args.resume.replace("model", "autoencoder"), map_location=device)
-            autoencoder.load_state_dict(ae_checkpoint["model_state_dict"])
-            logger.info(f"从检查点恢复: {args.resume}")
-        train_latent_diffusion(model, autoencoder, train_loader, val_loader, config, logger, device, rank, world_size)
-    
-    elif args.model_type == "stable":
-        from diffusers import StableDiffusionPipeline
-        model = StableDiffusionPipeline.from_pretrained(
-            config["model"]["pretrained_model_name_or_path"],
-            torch_dtype=torch.float16 if config["model"]["torch_dtype"] == "float16" else torch.float32,
-            revision=config["model"]["revision"]
-        ).to(device)
-        if args.resume:
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, args.resume)
-            logger.info(f"从检查点恢复: {args.resume}")
-        train_stable_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size)
-    
-    # 清理分布式环境
-    if world_size > 1:
-        dist.destroy_process_group()
+    # 构建UNet2DModel
+    unet_config = config["model"].copy()
+    unet_config['sample_size'] = image_size
+    unet_config['block_out_channels'] = block_out_channels
+    unet_config['num_class_embeds'] = num_class_embeds
+    unet_config['in_channels'] = 3
+    unet_config['out_channels'] = 3
+    model = UNet2DModel.from_config(unet_config).to(device)
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        logger.info(f"从检查点恢复: {args.resume}")
+    try:
+        train_image_diffusion(model, train_loader, val_loader, config, logger, device, rank, world_size, num_classes, args.dataset)
+    except Exception as e:
+        logger.error(f"Error during training: {str(e)}")
+        raise
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     main() 

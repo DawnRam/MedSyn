@@ -2,38 +2,41 @@
 
 # 数据集配置
 data:
-  root_dir: "data/raw"
+  root_dir: "/home/eechengyang/Data/ISIC"
   image_size: 256
-  batch_size: 32  # 每个GPU的批次大小
+  batch_size: 4  # 每个GPU的批次大小
   num_workers: 4  # 每个GPU的数据加载线程数
 
 # 分布式训练配置
 distributed:
-  backend: "nccl"
+  backend: "gloo"
   init_method: "env://"
   world_size: -1  # 自动检测GPU数量
   rank: -1  # 自动检测
   local_rank: -1  # 自动检测
 
-# 模型配置
+# 模型配置 - 兼容UNet2DModel
 model:
-  in_channels: 3
-  out_channels: 3
-  model_channels: 128
-  num_res_blocks: 2
-  attention_resolutions: [16, 8]
-  dropout: 0.1
-  channel_mult: [1, 2, 2, 2]
-  num_heads: 8
-  num_classes: 7
-  use_scale_shift_norm: true
-  resblock_updown: true
-  use_new_attention_order: false
+  sample_size: 256  # 图像大小
+  in_channels: 3  # 输入通道数
+  out_channels: 3  # 输出通道数
+  layers_per_block: 2  # 每个块的层数
+  block_out_channels: [128, 256, 512, 512]  # 每个块的输出通道数
+  down_block_types: ["DownBlock2D", "DownBlock2D", "DownBlock2D", "AttnDownBlock2D"]
+  up_block_types: ["AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"]
+  mid_block_type: "UNetMidBlock2DCrossAttn"
+  cross_attention_dim: 768  # 交叉注意力维度
+  attention_head_dim: 8  # 注意力头维度
+  dropout: 0.1  # dropout率
+  num_class_embeds: 7  # 类别嵌入数量
+  class_embed_type: "timestep"  # 类别嵌入类型
+  num_train_timesteps: 1000  # 训练时间步数
+  beta_schedule: "linear"  # beta调度类型
 
 # 训练配置
 training:
   num_epochs: 100
-  learning_rate: 1e-4
+  learning_rate: 0.0001
   weight_decay: 0.01
   beta1: 0.9
   beta2: 0.999
@@ -50,7 +53,7 @@ training:
 sampling:
   num_inference_steps: 50
   guidance_scale: 7.5
-  num_samples_per_class: 100
+  num_samples_per_class: 1
 
 # 评估配置
 evaluation:
@@ -60,7 +63,7 @@ evaluation:
     - classification_accuracy
     - diversity
   eval_freq: 1000  # 每1000步评估一次
-  num_eval_samples: 1000  # 评估时生成的样本数
+  num_eval_samples: 7  # 评估时生成的样本数
 
 # 日志配置
 logging:

@@ -5,7 +5,7 @@ NUM_GPUS=4
 MODEL_TYPE="image"  # image/latent/stable
 CONFIG="configs/image_diffusion.yaml"
 DATA_DIR="/home/eechengyang/Data/ISIC"  # 更新数据路径
-BATCH_SIZE=32
+BATCH_SIZE=1
 NUM_WORKERS=4
 MIXED_PRECISION=true
 ACCUMULATION_STEPS=1
@@ -16,6 +16,7 @@ WANDB_PROJECT="skin_lesion_synthesis"
 WANDB_NAME=""
 RESUME=""
 EXTRA_ARGS=""
+GPU_IDS="1,2,3,4" # 新增参数：指定GPU ID列表
 
 # 显示帮助信息
 show_help() {
@@ -36,6 +37,7 @@ show_help() {
     echo "  -p, --project NAME        Weights & Biases项目名 (默认: skin_lesion_synthesis)"
     echo "  -n, --name NAME           Weights & Biases运行名称"
     echo "  -r, --resume PATH         从检查点恢复训练"
+    echo "  -i, --gpu-ids IDS          指定要使用的GPU ID列表 (例如: '0,1,3')"
     echo "  -- EXTRA_ARGS             传递给训练脚本的额外参数"
 }
 
@@ -102,6 +104,10 @@ while [[ $# -gt 0 ]]; do
             RESUME="$2"
             shift 2
             ;;
+        -i|--gpu-ids) # 处理新的GPU ID参数
+            GPU_IDS="$2"
+            shift 2
+            ;;
         --)
             shift
             EXTRA_ARGS="$@"
@@ -155,6 +161,14 @@ export TRAIN_WARMUP_STEPS="$WARMUP_STEPS"
 export TRAIN_LEARNING_RATE="$LEARNING_RATE"
 export TRAIN_NUM_EPOCHS="$NUM_EPOCHS"
 
+# 如果指定了GPU ID，则设置CUDA_VISIBLE_DEVICES环境变量
+if [ ! -z "$GPU_IDS" ]; then
+    export CUDA_VISIBLE_DEVICES="$GPU_IDS"
+    # 根据指定的GPU数量更新NUM_GPUS
+    NUM_GPUS=$(echo "$GPU_IDS" | tr -cd ',' | wc -c)
+    NUM_GPUS=$((NUM_GPUS + 1))
+fi
+
 # 打印训练设置
 echo "训练设置:"
 echo "----------------------------------------"
@@ -175,6 +189,9 @@ if [ ! -z "$RESUME" ]; then
     echo "从检查点恢复: $RESUME"
 fi
 echo "----------------------------------------"
+
+# 打印环境变量值 (用于调试)
+echo "[DEBUG] TRAIN_DATA_DIR environment variable: $TRAIN_DATA_DIR"
 
 # 执行训练命令
 echo "开始训练..."

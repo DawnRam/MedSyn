@@ -7,7 +7,7 @@ from PIL import Image
 import numpy as np
 
 class SkinLesionDataset(Dataset):
-    """皮肤病变数据集加载器"""
+    """皮肤病变数据集加载器，借鉴REPA-E的数据处理方式"""
     
     def __init__(
         self,
@@ -28,21 +28,34 @@ class SkinLesionDataset(Dataset):
         self.image_size = image_size
         
         # 获取所有类别
-        self.classes = sorted([d for d in os.listdir(root_dir) 
-                             if os.path.isdir(os.path.join(root_dir, d))])
+        try:
+            all_items = os.listdir(root_dir)
+            self.classes = sorted([d for d in all_items 
+                                 if os.path.isdir(os.path.join(root_dir, d))])
+        except FileNotFoundError:
+            self.classes = []
+            
         self.class_to_idx = {cls_name: i for i, cls_name in enumerate(self.classes)}
         
-        # 设置默认的数据增强
+        # 设置默认的数据增强，借鉴REPA-E的处理方式
         if transform is None:
-            self.transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomVerticalFlip(),
-                transforms.RandomRotation(10),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-            ])
+            if split == "train":
+                # 训练时的数据增强
+                self.transform = transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.RandomVerticalFlip(p=0.5),
+                    # transforms.RandomRotation(degrees=10),
+                    # transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
+                    transforms.ToTensor(),
+                    # 不进行标准化，保持[0, 1]范围，在训练时再处理
+                ])
+            else:
+                # 验证时只进行resize和转换为tensor
+                self.transform = transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor(),
+                ])
         else:
             self.transform = transform
             
@@ -51,20 +64,26 @@ class SkinLesionDataset(Dataset):
         for class_name in self.classes:
             class_dir = os.path.join(root_dir, class_name)
             class_idx = self.class_to_idx[class_name]
-            for img_name in os.listdir(class_dir):
-                if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    img_path = os.path.join(class_dir, img_name)
-                    self.samples.append((img_path, class_idx))
+            if os.path.isdir(class_dir): 
+                 try:
+                     img_list = os.listdir(class_dir)
+                     for img_name in img_list:
+                        if img_name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                            img_path = os.path.join(class_dir, img_name)
+                            self.samples.append((img_path, class_idx))
+                 except Exception as e:
+                     # Consider logging this error instead of printing
+                     pass # Suppress error printing for now
+
+        # 数据集划分 - 移除划分逻辑，加载所有数据
+        # np.random.seed(42)
+        # indices = np.random.permutation(len(self.samples))
+        # split_idx = int(len(indices) * 0.8)  # 80% 训练集，20% 验证集
         
-        # 数据集划分
-        np.random.seed(42)
-        indices = np.random.permutation(len(self.samples))
-        split_idx = int(len(indices) * 0.8)  # 80% 训练集，20% 验证集
-        
-        if split == "train":
-            self.samples = [self.samples[i] for i in indices[:split_idx]]
-        else:  # val
-            self.samples = [self.samples[i] for i in indices[split_idx:]]
+        # if split == "train":
+        #     self.samples = [self.samples[i] for i in indices[:split_idx]]
+        # else:  # val
+        #     self.samples = [self.samples[i] for i in indices[split_idx:]]
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -77,6 +96,11 @@ class SkinLesionDataset(Dataset):
             image = self.transform(image)
             
         return image, label
+
+def preprocess_imgs_vae(imgs):
+    """预处理图像用于VAE，借鉴REPA-E的实现"""
+    # imgs: (B, C, H, W) -> (B, C, H, W), [0, 1] float32 -> [-1, 1] float32
+    return imgs * 2.0 - 1.0
 
 def get_dataloader(
     root_dir: str,

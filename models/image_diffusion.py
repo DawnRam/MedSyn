@@ -202,7 +202,28 @@ class ImageDiffusionModel(nn.Module):
             t (torch.Tensor): 时间步 [B]
         """
         # 时间嵌入
-        t = self.time_embed(t)
+        # 模仿标准的Sinusoidal位置编码并映射到model_channels维度
+        # 这里的实现是一个简化的版本，标准Diffusers实现更复杂
+        timesteps = t.long()
+        # Sinusoidal embeddings
+        freqs = torch.exp(
+            -torch.arange(0, self.model_channels, 2, dtype=torch.float32, device=t.device) *
+            torch.log(torch.tensor(10000.0, device=t.device)) / (self.model_channels - 2)
+        )
+        # Ensure freqs has the correct dtype for mixed precision if needed
+        if self.time_embed[0].weight.dtype == torch.float16:
+             freqs = freqs.to(dtype=torch.float16)
+
+        # Apply sinusoidal embeddings
+        # t has shape (B,), freqs has shape (model_channels/2,)
+        # Unsqueeze t to (B, 1) for broadcasting
+        # Output shape will be (B, model_channels/2)
+        t_emb = timesteps.unsqueeze(-1) * freqs # Shape: (B, model_channels / 2)
+        # Concatenate sin and cos embeddings
+        t_emb = torch.cat([torch.sin(t_emb), torch.cos(t_emb)], dim=-1) # Shape: (B, model_channels)
+
+        # 现在t_emb的形状是 (B, model_channels)，可以传递给self.time_embed
+        t = self.time_embed(t_emb)
         
         # 类别嵌入
         label_emb = self.label_embed(labels)
